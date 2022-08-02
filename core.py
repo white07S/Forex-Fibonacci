@@ -683,6 +683,200 @@ class FibFeatures:
         return memory_lt
     
 
+    def _build_fib_timematrix(self, memory_vector=None, memory_identity=None):
+        """creates a time-series matrix, for a given memory_vector (either s/t, med, or l/t"""
+        
+        if memory_vector is None:
+            print("memory vector is None in '_build_fib_timematrix'")
+            return None, None
+        if memory_identity is None:
+            # get the sequence/identity of the memory vector
+            memory_identity = memory_vector.memory_sequence
+        if self.n_fibs < memory_identity:
+            # the number of fibonnaci extensions is less than this identity, return defaults
+            print("number of fibs is less than the prescribed mem-identity %d" % memory_identity)
+            dummy_features = self._return_defaults(memory_identity,False)
+            return  memory_vector, dummy_features
+        n_ = memory_vector.shape[0]
+        # number of levels
+        n_levels = len(self.fib_levels)
+        subseq_changes = np.split(memory_vector, np.where(np.diff(memory_vector))[0]+1)
+        # get the meta-data for each (uniform) subsequence
+        subseqs_metadata = [{'start_loc':subseq.index[0], 'end_loc':subseq.index[-1], 'n':len(subseq), 'id':subseq.unique()[0]} for subseq in subseq_changes]
+        # empty containers: memory-fib-levels
+        master_memory = MemoryArray(data = np.zeros([n_levels, self.n_total]), memory_sequence = memory_identity)
+        #nm_features_get = ['max_drawdown', 'time_since_peak', 'duration', 'precovery']
+        nm_features_get = self.nm_features
+        # empty containers: features (filled with defaults
+        #master_features = np.zeros([self.n_total, len(nm_features_get)]) # container for features-time-series
+        master_features = make_default_features(nrows=self.n_total, default_features = fibs_get_default_features(which_memory = memory_identity))
+        # loop through fibonacci-sequences
+        for subseq in subseqs_metadata:
+            # indices for insertion in 
+            span_to_insert = (np.where(self.data_indices==subseq['start_loc'])[0][0],(np.where(self.data_indices==subseq['end_loc'])[0][0]+1))
+
+            # data fib_series to insert
+            data_to_insert = self.fib_series[subseq['id']].fib_series.get(start=subseq['start_loc'], end = subseq['end_loc'])
+
+            # insert the data into the memory
+            master_memory[:, span_to_insert[0]:span_to_insert[1]] = data_to_insert
+            master_memory.update_credible_start(credible_start = span_to_insert[0])
+
+            # gather features
+            feat_indx_insert = np.where((self.data_indices >= subseq['start_loc']) & (self.data_indices <= subseq['end_loc']))[0]
+            feat_indx_get = np.where((self.fib_series[subseq['id']].features[nm_features_get[0]].index >= subseq['start_loc']) & (self.fib_series[subseq['id']].features[nm_features_get[0]].index <= subseq['end_loc']))[0]
+            assert len(feat_indx_insert) == len(feat_indx_get)
+
+            # loop through and get features
+            for featnm in nm_features_get[:-1]:
+                #master_features[feat_indx_insert, j] = tx_feature(self.fib_series[subseq['id']].features[featnm].iloc[feat_indx_get], featnm)
+                master_features.insert(data = tx_feature(self.fib_series[subseq['id']].features[featnm].iloc[feat_indx_get], featnm),
+                                       iterable = feat_indx_insert,
+                                       column = featnm)
+
+        # get empirical values for
+        for featnm in nm_features_get[:-1]:
+            # '.get' function is used to get a subset of data, based on master-memory.credible_start, which is the first index of the first fibonacci retracement
+            feature_empirical_mean = numpy_trimmed_mean(master_features.get(range(master_memory.credible_start,self.n_total), column = featnm))
+            self.empiricals[featnm] += [feature_empirical_mean] 
+
+        return master_memory, master_features
+        
+    def _build_features0(self, memory, master_features, data):
+        """given a price (data['Close']) and master_memory of (selected) fib-levels, snake the price through the memory to get the relative price difference (as a feature)"""
+        
+        # identity (1,2,3) memory
+        memory_identity = memory.memory_sequence
+        
+        # check if no fibs exist
+        if self.n_fibs < memory_identity:
+            return master_features
+        
+        # fill-value (just for the arithmetic/min/max-finding)
+        fillvalue = data['Close'].max()*10
+        
+        # find the index-position (non-time) of the first-credible fib
+        cred_start = memory.credible_start
+        
+        # snake through price : get the top fib snake
+        snake1 = memory[:,cred_start:] - data['Close'].iloc[cred_start:].values
+        snake_plus = np.clip(snake1,0,10**10)
+        snake_plus[np.nonzero(snake_plus==0)]=fillvalue
+        top_fib = snake_plus.argmin(axis=0)
+        
+        # snake through price: get the bottom fib snake
+        snake_neg = np.clip(snake1,-10**10,0)
+        snake_neg[np.nonzero(snake_neg==0)]=-fillvalue
+        bottom_fib = snake_neg.argmax(axis=0)
+            
+        # snake through the fib levels
+        snake_through_fib_levels = np.array([self.fib_levels[i] for i in bottom_fib], dtype=np.float64)
+        if self.do_log_transform_fib_levels:
+            # convert the fib_level to semi-log scale
+            snake_through_fib_levels = np.log(1+2*snake_through_fib_levels)-1
+        
+        master_features.insert(data = snake_through_fib_levels,
+                               iterable = range(cred_start, master_features.shape[0]),
+                               column = 'fib_lev')
+        
+        # ensure that the topfib is at least as big as the bottom fib
+        top_fib = np.maximum(bottom_fib, top_fib)
+        
+        # price at the fibs
+        top_fib_price = memory[top_fib,np.arange(cred_start,memory.shape[-1])]
+        bottom_fib_price = memory[bottom_fib,np.arange(cred_start,memory.shape[-1])]
+        
+        # get the price differences (between the price and the fibs)
+        #fib_dist_to_top_fib = (top_fib_price-data['Close'].iloc[cred_start:].values)/data['Close'].iloc[cred_start:].values
+        #fib_dist_to_bot_fib = (data['Close'].iloc[cred_start:].values-bottom_fib_price)/data['Close'].iloc[cred_start:].values
+        # track the empirical values (for setting defaults)
+        #self.empiricals['topdist'] += [numpy_trimmed_mean(fib_dist_to_top_fib, trim=0.1)] 
+        #self.empiricals['botdist'] += [numpy_trimmed_mean(fib_dist_to_bot_fib, trim=0.1)]         
+
+        # convert distance to fibs as a [0,1] indicator; if beyond, convert to % above
+        z = data['Close'].iloc[cred_start:].values
+        range_fib_price = top_fib_price - bottom_fib_price
+        # 3 cases: if within [bottom, top], convert to [0,1] indicator
+        # ... if above: convert to [1,+] logged
+        # ... if below: convert to [-Inf, -0.0001]
+        fib_box_01 = (z - bottom_fib_price)/(range_fib_price + (range_fib_price==0))
+        fib_box_above = 1+np.log( z / top_fib_price)
+        fib_box_below = np.log(z / bottom_fib_price)
+        # combine cases: bools
+        is_case_01 = (z < top_fib_price) & (z > bottom_fib_price)
+        is_case_above = z>=top_fib_price
+        is_case_below = z<=bottom_fib_price
+        # combine cases
+        fib_box_dist = fib_box_01*is_case_01 + fib_box_above*is_case_above + fib_box_below*is_case_below
+        # add to empiricals
+        self.empiricals['box01'] += [numpy_trimmed_mean(fib_box_dist, trim=0.1)]
+        
+        # plot price snake through fib-boxes
+        if self.do_plot:
+            
+            # plot the raw fib-time-series
+            plt.figure(figsize=(15,9))
+            plt.plot(np.arange(len(data['Close'])),np.log(data['Close']))
+            plt.plot(np.log(memory.T), 'b--')
+            for fib in self.fib_series:
+                for level_ in fib.fib_series:
+                    plt.plot(fib.series_indices, np.log(level_))
+            
+            plt.savefig(self.plot_path + 'price_and_fibs-%d.png' % (memory.memory_sequence))
+            plt.close()
+            
+            # plot the fib-feature (price snakes through fibs)
+            plt.figure(figsize=(15,9))
+            plt.plot(data['Close'].iloc[cred_start:].index, np.log(top_fib_price))
+            plt.plot(data['Close'].iloc[cred_start:].index, np.log(bottom_fib_price))
+            plt.plot(data['Close'].iloc[cred_start:].index, np.log(data['Close'].iloc[cred_start:].values))
+            plt.savefig(self.plot_path + 'price-snake-through-fib-%d.png' % (memory.memory_sequence)) 
+            plt.close()
+        
+        # insert distance-to-top-fib into master-features
+        master_features.insert(data = fib_box_dist,
+                               iterable = range(cred_start, master_features.shape[0]),
+                               column ='box01')                    
+        #master_features.insert(data = fib_dist_to_top_fib,
+        #                       iterable = range(cred_start, master_features.shape[0]),
+        #                       column ='topdist')
+        # 
+        # insert distance-to-bottom-fib into master-features
+        #master_features.insert(data = fib_dist_to_bot_fib,
+        #                       iterable = range(cred_start, master_features.shape[0]),
+        #                       column ='botdist')
+        #
+        # feature names: update with name_mod
+        nm_feat = ['fib-%d_%s%s' % (memory.memory_sequence, nm_, self.name_mod) for nm_ in master_features.columns]
+        return master_features, nm_feat
+    
+    def features(self, data = None, return_memory = False):
+        """ main function:
+        wrapper for _build_fib_timematrix, runs on s/t,m/t and l/t memory
+        ... and _build_features0 (which outputs final features)
+        """
+        # features 1: most-recent drawdown
+        memory_st = self._get_shortterm_memory()
+        master_memory1, master_features1 = self._build_fib_timematrix(memory_vector=memory_st, memory_identity = 1)
+        
+        # features 2: previous drawdown
+        memory_mt = self._get_medterm_memory(memory_st = memory_st)
+        master_memory2, master_features2 = self._build_fib_timematrix(memory_vector=memory_mt, memory_identity = 2)
+        
+        # features 3: long-term drawdown
+        memory_lt = self._get_longterm_memory(memory_st = memory_st, memory_mt = memory_mt)
+        master_memory3, master_features3 = self._build_fib_timematrix(memory_vector=memory_lt, memory_identity = 3)
+        
+        if return_memory:
+            # option to return the raws (memory vector)
+            #return (master_memory1, master_memory2, master_memory3), (master_features1, master_features2, master_features3)
+            return (memory_st, memory_mt, memory_lt), (master_features1, master_features2, master_features3)
+        
+        features1, names1 = self._build_features0(master_memory1, master_features1, data)
+        features2, names2 = self._build_features0(master_memory2, master_features2, data)
+        features3, names3 = self._build_features0(master_memory3, master_features3, data)
+        
+        return (features1, features2, features3), (names1, names2,names3)
 
 
     
